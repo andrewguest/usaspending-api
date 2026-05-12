@@ -2,11 +2,11 @@
 
 ## Overview
 
-The existing `load_table_from_delta` management command performs a full reload of the target Postgres table every time it runs. For a table like `rpt.transaction_search` (253M+ rows), most nights change fewer than 500K rows, so exporting and re-importing the entire table is wasteful in terms of Spark compute, S3 I/O, and Postgres write amplification.
+The `load_table_from_delta` management command historically performed a full reload of the target Postgres table every time it ran. For a table like `rpt.transaction_search` (253M+ rows), most nights change fewer than 500K rows, so exporting and re-importing the entire table is wasteful in terms of Spark compute, S3 I/O, and Postgres write amplification.
 
-This document describes the new **incremental** flow that replays only the rows that changed, using Delta Lake's Change Data Feed (CDF) as the source of truth.
+This document describes the **incremental** mode added to the same command, which replays only the rows that changed using Delta Lake's Change Data Feed (CDF) as the source of truth.
 
-The full-reload command is preserved unchanged. The incremental flow is introduced as a separate, parallel code path so operators can continue to use full reloads when necessary (schema changes, recovery, backfills) while defaulting to incremental for nightly runs.
+The full-reload code path is preserved unchanged. Incremental mode is opt-in via the `--incremental` flag, so operators can continue to use full reloads when necessary (schema changes, recovery, backfills) while defaulting to incremental for nightly runs.
 
 ## Motivation Recap
 
@@ -26,14 +26,14 @@ Incremental goals:
 
 ## High-Level Architecture
 
-The incremental flow is composed of three new pieces plus a new tracking table:
+The incremental flow is composed of three new pieces plus a new tracking table, all driven by a new mode added to the existing command:
 
 | Piece | Location | Purpose |
 |---|---|---|
 | `CDFVersionTracking` model | `usaspending_api/etl/models.py` | Stores the last-processed Delta CDF version per logical table |
 | `cdf_reader` module | `usaspending_api/etl/cdf_reader.py` | Reads CDF from Delta via `delta-rs`, splits change types |
 | `cdf_apply` module | `usaspending_api/etl/cdf_apply.py` | Converts PyArrow data into Postgres COPY-compatible CSV buffers |
-| `load_table_from_delta_incremental` command | `usaspending_api/etl/management/commands/load_table_from_delta_incremental.py` | Orchestrates the end-to-end flow |
+| `load_table_from_delta --incremental` | `usaspending_api/etl/management/commands/load_table_from_delta.py` | New mode on the existing command. When `--incremental` is set, `handle()` dispatches to `_handle_incremental(...)` and the full-reload path is skipped. |
 
 The read path uses the `deltalake` Python package (delta-rs). It does not require Spark. The command uses Django's database connection so the data-apply step and the tracking-update step share a single atomic transaction.
 
@@ -56,7 +56,7 @@ The tracking row is **not seeded automatically**. An operator must seed it once 
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ load_table_from_delta_incremental --delta-table transaction_search
+│ load_table_from_delta --delta-table transaction_search --incremental
 └─────────────────────────────────────────────────────────────────┘
                                 │
                                 ▼
@@ -109,7 +109,7 @@ The tracking row is **not seeded automatically**. An operator must seed it once 
 
 ### 1. Spec Resolution
 
-The command accepts `--delta-table` (the key into `TABLE_SPEC`) and resolves:
+In incremental mode (`--incremental`), the command accepts `--delta-table` (the key into `TABLE_SPEC`) and resolves:
 
 - `primary_key_column` — new required field for incremental (e.g. `"transaction_id"`). If missing, the command fails fast with a clear error.
 - `destination_database` + `delta-table` key — used to build the `s3://` URI for the Delta table.
@@ -210,18 +210,18 @@ The `deleted_ids` list deliberately includes every PK present in the CDF (includ
 
 ## First-Run & Seeding
 
-Because the incremental command refuses to run without a `CDFVersionTracking` row, the first-run protocol is:
+Because incremental mode refuses to run without a `CDFVersionTracking` row, the first-run protocol is:
 
-1. Run a full reload via the existing `load_table_from_delta` command to get the Postgres table aligned with the Delta table.
+1. Run a full reload via `load_table_from_delta` (without `--incremental`) to get the Postgres table aligned with the Delta table.
 2. Identify the Delta commit version that was current at the time of that full reload (e.g., `DeltaTable(uri).version()`).
 3. Insert a `CDFVersionTracking` row with `table_name`, that `last_processed_version`, and a sensible `last_commit_timestamp`.
-4. From that point forward, scheduled incremental runs will pick up where the full reload left off.
+4. From that point forward, scheduled incremental runs (`load_table_from_delta --delta-table ... --incremental`) will pick up where the full reload left off.
 
-If the tracking row is ever lost or falls too far behind, the fallback is always a full reload via `load_table_from_delta` followed by re-seeding.
+If the tracking row is ever lost or falls too far behind, the fallback is always a full reload (omit `--incremental`) followed by re-seeding.
 
 ## Non-Disruption Guarantees
 
-- `load_table_from_delta` is unchanged. No shared mutable state.
+- `load_table_from_delta`'s full-reload code path is unchanged. The incremental path is added as a sibling: new arguments (`--incremental`, `--cleanup-staging`) and an early branch at the top of `handle()` that dispatches to `_handle_incremental(...)` and returns. Without `--incremental`, behavior is byte-for-byte identical to before.
 - No changes to `copy_table_metadata`, `csv_stream_s3_to_pg`, or Spark helpers.
 - The only TABLE_SPEC change is an additive optional field: `primary_key_column`. Tables without it are unaffected.
 - The `CDFVersionTracking` model is a new table in a new Django app migration (`etl/0006_create_cdf_version_tracking.py`); nothing existing was mutated.
@@ -233,9 +233,9 @@ If the tracking row is ever lost or falls too far behind, the fallback is always
 
 ## Operational Notes
 
-- The incremental command uses Django's database connection. It does not spin up Spark, so it can run on a much smaller instance than the full-reload command.
+- Incremental mode uses Django's database connection. It does not spin up Spark, so it can run on a much smaller instance than the full-reload mode.
 - For very large CDF windows (catching up after an outage), memory is the main concern — the Arrow table is materialized in memory. If a window is too large, run multiple incremental passes with narrower version ranges, or fall back to a full reload.
-- Staging tables in the `temp` schema persist across runs for auditability. They can be inspected directly (`SELECT * FROM temp.transaction_search_cdf_upserts LIMIT ...`) or dropped ad hoc.
+- Staging tables in the `temp` schema persist across runs for auditability. They can be inspected directly (`SELECT * FROM temp.transaction_search_cdf_upserts LIMIT ...`) or dropped ad hoc (or via `--cleanup-staging` at the end of a run).
 
 ## Future Work
 
