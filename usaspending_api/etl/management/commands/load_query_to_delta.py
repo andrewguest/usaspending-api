@@ -256,6 +256,7 @@ TABLE_SPEC = {
         "partition_column": "transaction_id",
         "partition_column_type": "numeric",
         "is_partition_column_unique": True,
+        "primary_key_column": "transaction_id",
         "delta_table_create_sql": transaction_search_create_sql_string,
         "delta_table_create_options": None,
         "source_schema": TRANSACTION_SEARCH_POSTGRES_COLUMNS,

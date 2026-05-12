@@ -93,6 +93,7 @@ dependencies = [
     "opentelemetry-semantic-conventions==0.49b2",
     "opentelemetry-util-http==0.49b2",
     # The above packages are listed and pinned to avoid using the 'opentelemetry-bootstrap -a install' command
+    "deltalake>=1.5.0",
 ]
 
 [project.optional-dependencies]
