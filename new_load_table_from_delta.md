@@ -129,8 +129,10 @@ The S3 URI is built via `build_delta_table_s3_uri(destination_database, destinat
 - Opens a `DeltaTable` with the right `storage_options` (AWS default credential chain when `USE_AWS=True`, else explicit keys + endpoint for local/sandbox).
 - Queries `dt.version()` to find the latest committed version.
 - If `starting_version >= latest_version`, returns `None` (nothing new).
-- Calls `dt.load_cdf(starting_version=last+1, ending_version=latest).read_all()` to get a PyArrow `Table`.
-- Returns a `CDFChangeSet` with the Arrow table, `latest_version`, and `max(_commit_timestamp)`.
+- Calls `dt.load_cdf(starting_version=last+1, ending_version=latest)`. In `deltalake` 1.x this returns an `arro3` `RecordBatchReader` (not pyarrow), so it is converted with `pa.table(...)` via the Arrow PyCapsule stream interface.
+- Returns a `CDFChangeSet` with the PyArrow table, `latest_version`, and `max(_commit_timestamp)`.
+
+In incremental mode the `--alt-delta-db` / `--alt-delta-name` arguments are honored the same way as in full-reload mode: they override the database/table used to build the S3 URI. The tracking record stays keyed by the `TABLE_SPEC` key, since the changes still apply to the same live Postgres table.
 
 ### 4. Split by Change Type
 
@@ -139,9 +141,10 @@ The S3 URI is built via `build_delta_table_s3_uri(destination_database, destinat
 - **`deleted_ids`**: distinct PKs across every row in the CDF, regardless of change type. Rationale: we use a delete-then-insert pattern for updates, and we want a retry after a partial failure to be idempotent. Deleting a PK that doesn't exist in Postgres is a no-op.
 - **`upsert_rows`**: rows where the **latest** (by `_commit_version`) non-preimage change type is `insert` or `update_postimage`. Implementation:
   1. Drop rows with `_change_type == update_preimage` (redundant — paired with postimage).
-  2. Per PK, keep the row with the largest `_commit_version`. Handled via a small pandas round-trip because PyArrow does not have a clean "keep-last-per-group" primitive.
-  3. Drop anything whose final change type is `delete` (handles the insert-then-delete-within-window case).
-  4. Strip the CDF metadata columns (`_change_type`, `_commit_version`, `_commit_timestamp`) so the Arrow schema matches the target Postgres schema.
+  2. Per PK, keep the row with the largest `_commit_version`. The dedup runs on a narrow 3-column frame (PK, `_commit_version`, `_change_type`) in pandas, and the winning row indices are applied back to the full-width Arrow table with `take()` — the wide table never round-trips through pandas (which would coerce nullable int columns to float64 and corrupt them).
+  3. A single Delta commit can contain both a `delete` and an `insert` for the same PK (e.g. `INSERT OVERWRITE`). The sort is stable and uses `_change_type` as a tiebreaker (`delete` < `insert` < `update_postimage` alphabetically), so within one commit the upsert wins.
+  4. Drop anything whose final change type is `delete` (handles the insert-then-delete-within-window case).
+  5. Strip the CDF metadata columns (`_change_type`, `_commit_version`, `_commit_timestamp`) so the Arrow schema matches the target Postgres schema.
 
 ### 5. Staging Tables
 
@@ -157,7 +160,9 @@ Both tables are dropped and recreated at the **start** of each run. That guarant
 The `cdf_apply` module turns Python/Arrow data into CSV buffers the Postgres COPY command can consume:
 
 - `ids_to_csv_buffer(ids)` writes a single-column CSV for the deletes staging table.
-- `arrow_to_pg_csv_buffer(table, column_order)` reorders the Arrow table to the canonical column order, renders list columns as Postgres array literals (`{"a","b"}`) with proper escaping and NULL handling, and writes CSV via pandas with `na_rep=""` and `QUOTE_MINIMAL`.
+- `arrow_to_pg_csv_buffer(table, column_order)` reorders the Arrow table to the canonical column order, renders list columns as Postgres array literals (`{"a","b"}`) with proper escaping and NULL handling, and writes CSV via pandas with `QUOTE_MINIMAL`. The pandas conversion uses `types_mapper=pd.ArrowDtype` so nullable integer columns stay integers (the default conversion turns them into float64, rendering `123` as `123.0`, which COPY rejects for integer columns) and very old timestamps don't overflow `datetime64[ns]`.
+- SQL NULLs are written as the `\N` marker (`PG_COPY_NULL`), and the upserts COPY runs with `(FORMAT CSV, NULL '\N')`. This keeps empty strings distinct from NULLs — an unquoted empty field is an empty string, `\N` is NULL — matching the fidelity of the Spark full-reload path.
+- After both COPYs, the staging tables are `ANALYZE`d inside the transaction so the planner has real row counts when choosing the plan for the apply step.
 
 Data goes directly from memory into Postgres via `cursor.copy_expert(...)`. No S3 round-trip, no filesystem temp files, no Spark cluster.
 
@@ -182,6 +187,8 @@ The `DELETE ... USING` form lets Postgres plan a hash join against the staging t
 
 Everything from staging-table DDL through the tracking update runs inside a single `transaction.atomic()` block on Django's database connection. Postgres supports DDL inside transactions, so a mid-flow crash rolls back cleanly, including the staging `CREATE TABLE` statements themselves.
 
+The transaction opens by taking `pg_advisory_xact_lock(hashtext('cdf_incremental_<table>'))`, so two concurrent incremental runs against the same logical table serialize explicitly rather than contending on staging-table locks. The lock releases automatically at commit/rollback.
+
 Failure scenarios:
 
 - **CDF read fails**: no transaction has started yet; nothing to roll back.
@@ -205,6 +212,7 @@ The CDF window we pull can span many commits, and the same PK can appear multipl
 | Insert then delete | `insert X`, `delete X` | `{X}` | — | X absent |
 | Deleted then re-inserted | `delete X`, `insert X''` | `{X}` | `X''` | X present with new values |
 | Updated then deleted | `preimage X`, `postimage X'`, `delete X` | `{X}` | — | X absent |
+| Delete + insert in one commit (overwrite) | `delete X`, `insert X''` (same `_commit_version`) | `{X}` | `X''` | X present with new values (stable sort tiebreaks by change type) |
 
 The `deleted_ids` list deliberately includes every PK present in the CDF (including rows that also appear in `upsert_rows`). This preserves the simple DELETE-then-INSERT pattern without needing ON CONFLICT clauses or enumerated UPDATE SET statements, and makes retries idempotent.
 
@@ -228,8 +236,10 @@ If the tracking row is ever lost or falls too far behind, the fallback is always
 
 ## Dependencies
 
-- `deltalake==1.5.x` added to `pyproject.toml` (via `uv add deltalake`). This is independent of `delta-spark`, which stays in place for the full-reload command.
-- `pandas` is already a transitive dependency of the project.
+- `deltalake==1.5.x` added to `pyproject.toml` (via `uv add deltalake`). This is independent of `delta-spark`, which stays in place for the full-reload mode.
+- `pyarrow` added as an explicit dependency (via `uv add pyarrow`). `deltalake` 1.x does not depend on pyarrow (it ships `arro3` instead), so it must be declared directly.
+- `pandas` is already a project dependency.
+- The CDF modules are imported lazily inside the incremental methods, so a problem with `deltalake`/`pyarrow` in a given environment can never break full-reload mode.
 
 ## Operational Notes
 
@@ -240,7 +250,7 @@ If the tracking row is ever lost or falls too far behind, the fallback is always
 ## Future Work
 
 - Enable the incremental flow for other tables in `TABLE_SPEC` by adding `primary_key_column` entries.
-- Consider a pure-Arrow (or DuckDB-backed) dedup implementation to avoid the pandas round-trip if memory becomes a concern.
+- Push `_change_type != 'update_preimage'` down into `load_cdf(predicate=...)` to cut read memory roughly in half on update-heavy windows (needs verification that predicates apply to CDF metadata columns).
 - Integrate with the OpenSearch indexer so the same CDF Arrow table can drive both Postgres and OpenSearch updates in one pass.
 - Optional `--end-version` argument to process CDF in chunks for catch-up scenarios.
 - Metrics/alerts on version lag (`latest_version - last_processed_version`) so a stuck incremental is visible.

@@ -89,10 +89,14 @@ def read_cdf_changes(
         f"Loading CDF from {delta_table_uri} for versions "
         f"{starting_version + 1}..{latest_version}"
     )
-    cdf = dt.load_cdf(
-        starting_version=starting_version + 1,
-        ending_version=latest_version,
-    ).read_all()
+    # load_cdf returns an arro3 RecordBatchReader (deltalake 1.x no longer returns pyarrow
+    # objects); pa.table() converts it via the Arrow PyCapsule stream interface
+    cdf = pa.table(
+        dt.load_cdf(
+            starting_version=starting_version + 1,
+            ending_version=latest_version,
+        )
+    )
 
     if cdf.num_rows == 0:
         return None
@@ -123,10 +127,16 @@ def split_cdf_by_change_type(
     if non_preimage.num_rows == 0:
         upsert_rows = non_preimage
     else:
-        df = non_preimage.to_pandas()
-        df = df.sort_values("_commit_version").drop_duplicates(subset=[pk_column], keep="last")
-        df = df[df["_change_type"].isin(UPSERT_CHANGE_TYPES)]
-        upsert_rows = pa.Table.from_pandas(df, preserve_index=False)
+        # Dedup on a narrow frame and select winners with take() so the full-width table
+        # never round-trips through pandas (which would coerce nullable ints to float64)
+        meta = non_preimage.select([pk_column, "_commit_version", "_change_type"]).to_pandas()
+        # A single commit can hold both a delete and an insert for one PK (e.g. INSERT
+        # OVERWRITE). The stable sort with _change_type as tiebreaker resolves it:
+        # 'delete' < 'insert' < 'update_postimage', so keep="last" favors the upsert.
+        meta = meta.sort_values(["_commit_version", "_change_type"], kind="stable")
+        meta = meta.drop_duplicates(subset=[pk_column], keep="last")
+        meta = meta[meta["_change_type"].isin(UPSERT_CHANGE_TYPES)]
+        upsert_rows = non_preimage.take(meta.index.to_numpy())
 
     cols_to_drop = [c for c in CDF_METADATA_COLUMNS if c in upsert_rows.column_names]
     if cols_to_drop:

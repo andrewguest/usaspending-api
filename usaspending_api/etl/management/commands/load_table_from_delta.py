@@ -8,7 +8,7 @@ import boto3
 import numpy as np
 import psycopg2
 from django import db
-from django.core.management.base import BaseCommand, CommandParser
+from django.core.management.base import BaseCommand, CommandError, CommandParser
 from django.db import transaction
 from django.db.models import Model
 from pyspark.sql import DataFrame, SparkSession
@@ -23,16 +23,12 @@ from usaspending_api.common.helpers.spark_helpers import (
 )
 from usaspending_api.common.helpers.sql_helpers import get_database_dsn_string
 from usaspending_api.config import CONFIG
-from usaspending_api.etl.cdf_apply import arrow_to_pg_csv_buffer, ids_to_csv_buffer
-from usaspending_api.etl.cdf_reader import (
-    build_delta_table_s3_uri,
-    get_last_processed_version,
-    read_cdf_changes,
-    split_cdf_by_change_type,
-    update_last_processed_version,
-)
 from usaspending_api.etl.management.commands.create_delta_table import TABLE_SPEC
 from usaspending_api.settings import DEFAULT_TEXT_SEARCH_CONFIG
+
+# NOTE: the incremental (CDF) flow's dependencies (usaspending_api.etl.cdf_reader / cdf_apply,
+# which pull in deltalake and pyarrow) are imported lazily inside the incremental methods so
+# that any issue with those packages can never affect the full-reload mode of this command.
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +175,18 @@ class Command(BaseCommand):
             split_dfs.append(split_df)
         return split_dfs
 
+    def _validate_mode_arguments(self, options: dict[str, Any]) -> None:
+        full_reload_only_args = ["jdbc_inserts", "recreate", "keep_csv_files", "reset_sequence", "additional_columns"]
+        if options["incremental"]:
+            provided = [arg for arg in full_reload_only_args if options[arg]]
+            if provided:
+                flags = ", ".join("--" + arg.replace("_", "-") for arg in provided)
+                raise CommandError(f"--incremental cannot be combined with full-reload-only arguments: {flags}")
+        elif options["cleanup_staging"]:
+            raise CommandError("--cleanup-staging is only valid with --incremental")
+
     def handle(self, *args, **options) -> None:  # noqa: C901,PLR0912,PLR0915
+        self._validate_mode_arguments(options)
         if options["incremental"]:
             self._handle_incremental(options)
             return
@@ -672,6 +679,14 @@ class Command(BaseCommand):
         return column_names or []
 
     def _handle_incremental(self, options: dict[str, Any]) -> None:
+        from usaspending_api.etl.cdf_reader import (
+            build_delta_table_s3_uri,
+            get_last_processed_version,
+            read_cdf_changes,
+            split_cdf_by_change_type,
+            update_last_processed_version,
+        )
+
         delta_table = options["delta_table"]
         spec = TABLE_SPEC[delta_table]
 
@@ -682,7 +697,8 @@ class Command(BaseCommand):
                 f"The incremental flow requires this field."
             )
 
-        destination_database = spec.get("destination_database")
+        destination_database = options["alt_delta_db"] or spec.get("destination_database")
+        delta_table_name = options["alt_delta_name"] or delta_table
         swap_schema = spec.get("swap_schema")
         swap_table = spec.get("swap_table")
         column_names = spec.get("column_names")
@@ -696,6 +712,8 @@ class Command(BaseCommand):
         deletes_staging = f"temp.{swap_table}_cdf_deletes"
         upserts_staging = f"temp.{swap_table}_cdf_upserts"
 
+        # Tracking stays keyed by the TABLE_SPEC key even when --alt-delta-db/--alt-delta-name
+        # override the CDF source, since they target the same live Postgres table
         last_version = get_last_processed_version(delta_table)
         if last_version is None:
             logger.warning(
@@ -704,7 +722,9 @@ class Command(BaseCommand):
             )
             return
 
-        delta_uri = build_delta_table_s3_uri(destination_database, delta_table)
+        delta_uri = build_delta_table_s3_uri(destination_database, delta_table_name)
+        if options["alt_delta_db"] or options["alt_delta_name"]:
+            logger.info(f"Using alternate Delta source {delta_uri} (tracking key remains {delta_table!r}).")
         change_set = read_cdf_changes(delta_uri, starting_version=last_version)
         if change_set is None:
             logger.info(f"Nothing to apply for {delta_table!r}.")
@@ -719,6 +739,8 @@ class Command(BaseCommand):
 
         with transaction.atomic():
             with db.connection.cursor() as cursor:
+                # Serialize concurrent incremental runs against the same logical table
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", [f"cdf_incremental_{delta_table}"])
                 self._recreate_cdf_staging(cursor, deletes_staging, upserts_staging, live_table, pk_column)
                 self._populate_cdf_staging(
                     cursor,
@@ -770,6 +792,8 @@ class Command(BaseCommand):
         deleted_ids,
         upsert_rows,
     ):
+        from usaspending_api.etl.cdf_apply import PG_COPY_NULL, arrow_to_pg_csv_buffer, ids_to_csv_buffer
+
         if deleted_ids:
             logger.info(f"Staging {len(deleted_ids)} PK(s) to {deletes_staging} via COPY.")
             buffer = ids_to_csv_buffer(deleted_ids)
@@ -781,9 +805,16 @@ class Command(BaseCommand):
             logger.info(f"Staging {upsert_rows.num_rows} row(s) to {upserts_staging} via COPY.")
             buffer = arrow_to_pg_csv_buffer(upsert_rows, column_names)
             cursor.copy_expert(
-                sql=f"COPY {upserts_staging} ({','.join(column_names)}) FROM STDIN (FORMAT CSV)",
+                sql=(
+                    f"COPY {upserts_staging} ({','.join(column_names)}) "
+                    f"FROM STDIN (FORMAT CSV, NULL '{PG_COPY_NULL}')"
+                ),
                 file=buffer,
             )
+        # Freshly created tables have no statistics; give the planner real row counts so it
+        # can choose a sane plan for the DELETE ... USING join against the live table
+        cursor.execute(f"ANALYZE {deletes_staging}")
+        cursor.execute(f"ANALYZE {upserts_staging}")
 
     def _apply_cdf_deletes(self, cursor, live_table, deletes_staging, pk_column) -> int:
         cursor.execute(
