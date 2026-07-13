@@ -29,6 +29,26 @@ from usaspending_api.search.v2.elasticsearch_helper import (
 
 logger = logging.getLogger(__name__)
 
+# RecipientLookup location columns mapped to the keys used in the API response.
+LOCATION_ANNOTATIONS = {
+    "address_line1": F("address_line_1"),
+    "address_line2": F("address_line_2"),
+    "city_name": F("city"),
+    "state_code": F("state"),
+    "zip": F("zip5"),
+    "congressional_code": F("congressional_district"),
+}
+LOCATION_VALUES = [
+    "address_line1",
+    "address_line2",
+    "city_name",
+    "state_code",
+    "zip",
+    "zip4",
+    "country_code",
+    "congressional_code",
+]
+
 
 def validate_recipient_id(recipient_id: str) -> None:
     """Validate [uei/duns/name]-[recipient_type] hash
@@ -58,24 +78,47 @@ def validate_recipient_id(recipient_id: str) -> None:
     return recipient_hash, recipient_level
 
 
-def extract_duns_uei_name_from_hash(recipient_hash: str):  # noqa: ANN201
+def extract_duns_uei_name_from_hash(recipient_hash: str, recipient_lookup: dict | None = None):  # noqa: ANN201
     """Extract the name and duns from the recipient hash
+
+    Args:
+        recipient_hash: uuid of the hash+duns to look up
+        recipient_lookup: an already-fetched RecipientLookup record for this hash; when
+            provided the database query is skipped so callers can reuse a single lookup
+
+    Returns:
+        duns and name
+    """
+    if recipient_lookup is None:
+        recipient_lookup = (
+            RecipientLookup.objects.filter(recipient_hash=recipient_hash)
+            .values("duns", "uei", "legal_business_name")
+            .first()
+        )
+    if not recipient_lookup:
+        return None, None, None
+    else:
+        return recipient_lookup["duns"], recipient_lookup["uei"], recipient_lookup["legal_business_name"]
+
+
+def extract_recipient_lookup(recipient_hash: str) -> dict | None:
+    """Fetch the RecipientLookup record once with every field the overview needs.
+
+    Consolidates what used to be three separate queries against the same recipient_hash
+    (name/duns/uei, alternate_names, and location) into a single database read.
 
     Args:
         recipient_hash: uuid of the hash+duns to look up
 
     Returns:
-        duns and name
+        dict of the RecipientLookup values, or None if no record exists
     """
-    duns_uei_name_qs = (
+    return (
         RecipientLookup.objects.filter(recipient_hash=recipient_hash)
-        .values("duns", "uei", "legal_business_name")
+        .annotate(**LOCATION_ANNOTATIONS)
+        .values("duns", "uei", "legal_business_name", "alternate_names", *LOCATION_VALUES)
         .first()
     )
-    if not duns_uei_name_qs:
-        return None, None, None
-    else:
-        return duns_uei_name_qs["duns"], duns_uei_name_qs["uei"], duns_uei_name_qs["legal_business_name"]
 
 
 def extract_parents_from_hash(recipient_hash: str) -> dict:
@@ -96,23 +139,30 @@ def extract_parents_from_hash(recipient_hash: str) -> dict:
         .values("recipient_affiliations")
         .first()
     )
+    affiliated_ueis = affiliations["recipient_affiliations"]
 
-    for uei in affiliations["recipient_affiliations"]:
-        parent = (
-            RecipientLookup.objects.filter(uei=uei)
-            .values("recipient_hash", "uei", "duns", "legal_business_name")
-            .order_by("-update_date")
-            .first()
-        )
-        name, duns, uei, parent_id = None, None, None, None
+    # Fetch every affiliated parent in a single query, then keep the most recent record
+    # per uei (ordered by -update_date so the first one seen for each uei is the latest).
+    parent_lookups = (
+        RecipientLookup.objects.filter(uei__in=affiliated_ueis)
+        .values("recipient_hash", "uei", "duns", "legal_business_name")
+        .order_by("-update_date")
+    )
+    latest_parent_by_uei = {}
+    for parent_lookup in parent_lookups:
+        latest_parent_by_uei.setdefault(parent_lookup["uei"], parent_lookup)
+
+    for uei in affiliated_ueis:
+        parent = latest_parent_by_uei.get(uei)
+        name, duns, parent_uei, parent_id = None, None, None, None
 
         if parent:
             name = parent["legal_business_name"]
             duns = parent["duns"]
-            uei = parent["uei"]
+            parent_uei = parent["uei"]
             parent_id = "{}-P".format(parent["recipient_hash"])
 
-        parents.append({"parent_duns": duns, "parent_name": name, "parent_id": parent_id, "parent_uei": uei})
+        parents.append({"parent_duns": duns, "parent_name": name, "parent_id": parent_id, "parent_uei": parent_uei})
     return parents
 
 
@@ -145,11 +195,13 @@ def cleanup_location(location: dict) -> dict:
     return location
 
 
-def extract_location(recipient_hash: str) -> dict:
+def extract_location(recipient_hash: str, recipient_lookup: dict | None = None) -> dict:
     """Extract the location data via the recipient hash
 
     Args:
         recipient_hash: uuid of the hash+duns to look up
+        recipient_lookup: an already-fetched RecipientLookup record (annotated with the
+            LOCATION_VALUES keys) for this hash; when provided the database query is skipped
 
     Returns:
         dict of location info
@@ -169,29 +221,15 @@ def extract_location(recipient_hash: str) -> dict:
         "country_code": None,
         "congressional_code": None,
     }
-    annotations = {
-        "address_line1": F("address_line_1"),
-        "address_line2": F("address_line_2"),
-        "city_name": F("city"),
-        "state_code": F("state"),
-        "zip": F("zip5"),
-        "congressional_code": F("congressional_district"),
-    }
-    values = [
-        "address_line1",
-        "address_line2",
-        "city_name",
-        "state_code",
-        "zip",
-        "zip4",
-        "country_code",
-        "congressional_code",
-    ]
-    found_location = (
-        RecipientLookup.objects.filter(recipient_hash=recipient_hash).annotate(**annotations).values(*values).first()
-    )
-    if found_location:
-        location.update(found_location)
+    if recipient_lookup is None:
+        recipient_lookup = (
+            RecipientLookup.objects.filter(recipient_hash=recipient_hash)
+            .annotate(**LOCATION_ANNOTATIONS)
+            .values(*LOCATION_VALUES)
+            .first()
+        )
+    if recipient_lookup:
+        location.update({key: recipient_lookup[key] for key in LOCATION_VALUES})
         location = cleanup_location(location)
     return location
 
@@ -345,14 +383,16 @@ class RecipientOverView(APIView):
         get_request = request.query_params
         year = validate_year(get_request.get("year", "latest"))
         recipient_hash, recipient_level = validate_recipient_id(recipient_id)
-        recipient_duns, recipient_uei, recipient_name = extract_duns_uei_name_from_hash(recipient_hash)
+
+        # Single RecipientLookup read reused for name/duns/uei, alternate_names, and location
+        recipient_lookup = extract_recipient_lookup(recipient_hash)
+        recipient_duns, recipient_uei, recipient_name = extract_duns_uei_name_from_hash(
+            recipient_hash, recipient_lookup
+        )
         if not (recipient_name or recipient_duns or recipient_uei):
             raise InvalidParameterException("Recipient Hash not found: '{}'.".format(recipient_hash))
 
-        alternate_names = (
-            RecipientLookup.objects.filter(recipient_hash=recipient_hash).values("alternate_names").first()
-        )
-        alternate_names = sorted(alternate_names.get("alternate_names", []))
+        alternate_names = sorted((recipient_lookup or {}).get("alternate_names") or [])
 
         parents = []
         if recipient_level == "C":
@@ -367,7 +407,7 @@ class RecipientOverView(APIView):
                 }
             ]
 
-        location = extract_location(recipient_hash)
+        location = extract_location(recipient_hash, recipient_lookup)
         business_types = extract_business_categories(recipient_name, recipient_uei, recipient_hash)
         results = obtain_recipient_totals(recipient_id, year=year)
         recipient_totals = results[0] if results else {}
