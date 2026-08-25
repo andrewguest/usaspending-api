@@ -28,6 +28,7 @@ dependencies = [
     "databricks-sdk==0.44.1",
     "dataclasses-json==0.6.*",
     "dj-database-url==2.1.0",
+    "django-allow-cidr==0.8.0",
     "django-cors-headers==4.3.*",
     "django-debug-toolbar==4.3.*",
     "django-extensions==3.2.*",
@@ -49,12 +50,14 @@ dependencies = [
     "numpy==1.26.*",
     "openpyxl==3.1.*",
     "pandas==2.2.*",
+    "pgvector>=0.5.0",
     "psutil==5.9.*",
     "psycopg>=3.3.3",
     "py-gfm==2.0.0",
     "pydantic==2.12",
     "pydantic-settings>=2.13.1",
     "python-json-logger==2.0.7",
+    "pyyaml>=6.0.3",
     "requests",
     "retrying==1.3.4",
     "sqlparse==0.5.*",
@@ -116,8 +119,8 @@ dev = [
     "ruff==0.14.14",
 ]
 spark = [
-    "delta-spark==3.2.*",
-    "pyspark==3.5.0",
+    "delta-spark==3.3.2",
+    "pyspark==3.5.6",
 ]
 server = [
     "django-redis==5.4.*",
@@ -215,6 +218,7 @@ pycodestyle.max-line-length = 120
     "ANN001", # missing-type-function-argument; avoid conflict with fixtures
     "ANN201", # missing-return-type-undocumented-public-function; avoid conflict with test case return values
     "ANN202", # missing-return-type-undocumented-private-function; avoid conflict with test case return values
+    "PLR0911", # too-many-return-statements; avoid conflict with too many return statements
     "PLR0913", # too-many-arguments; avoid conflict with too many fixtures
     "PLR0915", # too-many-statements; avoid conflict with long fixtures
 ]
